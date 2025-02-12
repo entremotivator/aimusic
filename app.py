@@ -1,143 +1,98 @@
-import streamlit as st
-import os
-import tempfile
-from pytube import YouTube
-from moviepy.editor import *
-import requests
-import string
-import codecs
-import io
-from gtts import gTTS
-from pydub import AudioSegment
-import librosa
-import openai
+from audiocraft.models import MusicGen
+import streamlit as st 
+import torch 
+import torchaudio
+import os 
+import numpy as np
+import base64
 
-# --- Function Definitions ---
+@st.cache_resource
+def load_model():
+    model = MusicGen.get_pretrained('facebook/musicgen-small')
+    return model
 
-def download_youtube_video_tonewName(url):
-    try:
-        yt = YouTube(url)
-        stream = yt.streams.filter(only_audio=True).first()
-        filename = stream.download()
-        new_filename = "music.mp3"
-        os.rename(filename, new_filename)
+def generate_music_tensors(description, duration: int):
+    print("Description: ", description)
+    print("Duration: ", duration)
+    model = load_model()
 
-        # 轉換音訊編解碼器
-        sound = AudioSegment.from_file(new_filename)
-        sound.export(new_filename, format="mp3", bitrate="192k")
-
-        return new_filename
-    except Exception as e:
-        st.error(f"Error downloading YouTube video: {e}")
-        return None
-
-def extract_audio_from_video(video_path):
-    try:
-        with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_audio:
-
-            audioclip = AudioFileClip(video_path)
-
-            allAudio = []
-            # 切割音訊
-            duration = audioclip.duration
-            start_time = 0  # 起始時間，單位為秒
-            end_time = 660  # 結束時間，單位為秒
-            count = 1
-            while start_time < duration:
-                if end_time > duration:
-                    end_time = duration
-                # 切割音訊
-                new_audioclip = audioclip.subclip(start_time, end_time)
-
-                name = temp_audio.name
-                # 使用 replace() 函数删除空格
-                name = name.replace(" ", "")
-
-                # 使用 translate() 函数删除标点符号
-                name = name.translate(str.maketrans("", "", string.punctuation))
-
-                # 儲存音訊
-                output_path = "{}_{}.mp3".format(temp_audio.name, count)
-                new_audioclip.audio.write_audiofile(output_path, codec='mp3')
-
-                allAudio.append(output_path)
-
-                start_time = end_time
-                end_time += 660
-                count += 1
-
-            audioclip.close()
-            return allAudio
-    except Exception as e:
-        st.error(f"Error extracting audio: {e}")
-        return []
-
-
-# --- Streamlit App ---
-
-st.title("YouTube to Text with OpenAI")
-
-# --- Sidebar for API Key Input ---
-with st.sidebar:
-    st.title("Settings")
-    st.markdown("### Enter your OpenAI API Key below:")
-
-    # Initialize session state for the API key
-    if "api_key" not in st.session_state:
-        st.session_state.api_key = ""
-
-    # Input field for the API key
-    st.session_state.api_key = st.text_input(
-        "API Key",
-        type="password",
-        placeholder="Enter your OpenAI API key",
-        key="api_key_input"
+    model.set_generation_params(
+        use_sampling=True,
+        top_k=250,
+        duration=duration
     )
 
-    # Display the current status of the API key
-    if st.session_state.api_key:
-        st.success("API Key saved successfully!")
-        openai.api_key = st.session_state.api_key  # Set the OpenAI API key
-    else:
-        st.warning("Please enter your API Key.")
+    output = model.generate(
+        descriptions=[description],
+        progress=True,
+        return_tokens=True
+    )
+
+    return output[0]
 
 
-# --- Main App Content ---
+def save_audio(samples: torch.Tensor):
+    """Renders an audio player for the given audio samples and saves them to a local directory.
 
-youtube_url = st.text_input("Enter YouTube URL:")
+    Args:
+        samples (torch.Tensor): a Tensor of decoded audio samples
+            with shapes [B, C, T] or [C, T]
+        sample_rate (int): sample rate audio should be displayed with.
+        save_path (str): path to the directory where audio should be saved.
+    """
 
-if st.button("Process YouTube Video"):
-    if not st.session_state.api_key:
-        st.error("Please enter your OpenAI API Key in the sidebar.")
-    elif youtube_url:
-        try:
-            st.info("Downloading and processing audio...")
-            audio_file_name = download_youtube_video_tonewName(youtube_url)
+    print("Samples (inside function): ", samples)
+    sample_rate = 32000
+    save_path = "audio_output/"
+    assert samples.dim() == 2 or samples.dim() == 3
 
-            if audio_file_name:  # Only proceed if download was successful
-                st.success(f"Audio downloaded: {audio_file_name}")
+    samples = samples.detach().cpu()
+    if samples.dim() == 2:
+        samples = samples[None, ...]
 
-                st.info("Extracting audio from video...")
-                audio_chunks = extract_audio_from_video(audio_file_name)
-                st.success(f"Audio extracted into {len(audio_chunks)} chunks.")
+    for idx, audio in enumerate(samples):
+        audio_path = os.path.join(save_path, f"audio_{idx}.wav")
+        torchaudio.save(audio_path, audio, sample_rate)
 
-                full_text = ""
-                for i, chunk in enumerate(audio_chunks):
-                    st.info(f"Transcribing chunk {i + 1}/{len(audio_chunks)}...")
-                    try:
-                        with open(chunk, "rb") as audio_file:
-                            transcript = openai.Audio.transcribe("whisper-1", audio_file)
-                            text = transcript["text"]
-                            full_text += text + "\n\n"
-                        st.success(f"Chunk {i + 1} transcribed.")
-                    except Exception as e:
-                        st.error(f"Error transcribing chunk {i + 1}: {e}")
-                        break  # Stop if one chunk fails. consider logging or skipping instead.
+def get_binary_file_downloader_html(bin_file, file_label='File'):
+    with open(bin_file, 'rb') as f:
+        data = f.read()
+    bin_str = base64.b64encode(data).decode()
+    href = f'<a href="data:application/octet-stream;base64,{bin_str}" download="{os.path.basename(bin_file)}">Download {file_label}</a>'
+    return href
 
-                st.subheader("Transcription:")
-                st.write(full_text)
+st.set_page_config(
+    page_icon= "musical_note",
+    page_title= "Music Gen"
+)
 
-        except Exception as e:
-            st.error(f"An error occurred: {e}")
-    else:
-        st.warning("Please enter a YouTube URL.")
+def main():
+
+    st.title("AI Music Generator")
+
+    with st.expander("See explanation"):
+        st.write("This Music Generator app built using Meta's Audiocraft library. We are using Music Gen Small model.")
+
+    text_area = st.text_area("Enter your description:")
+    time_slider = st.slider("Select time duration (In Seconds)", 0, 20, 10)
+
+    if text_area and time_slider:
+        st.json({
+            'Your Description': text_area,
+            'Selected Time Duration (in Seconds)': time_slider
+        })
+
+        st.subheader("Generated Music")
+        music_tensors = generate_music_tensors(text_area, time_slider)
+        print("Musci Tensors: ", music_tensors)
+        save_music_file = save_audio(music_tensors)
+        audio_filepath = 'audio_output/audio_0.wav'
+        audio_file = open(audio_filepath, 'rb')
+        audio_bytes = audio_file.read()
+        st.audio(audio_bytes)
+        st.markdown(get_binary_file_downloader_html(audio_filepath, 'Audio'), unsafe_allow_html=True)
+
+
+if __name__ == "__main__":
+    main()
+    
